@@ -1,85 +1,35 @@
-from pyspark.sql import functions as F
-from datetime import datetime, timedelta
-
-def feat_user_inferred_affinity_flags_long(
-    app_catalog_table="prod_atlas_datalake.ignite_silver.app_catalog_reporting_vw",
-    mapping_source_table="prod_atlas_datalake.unified_dimensions.app_taxonomy_mapping",
-    run_date=(datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d"),  # logical date = yesterday
-    z_threshold=1.0
-):
-    # snapshot of app catalog (same helper you already use)
-    app_catalog_df = _get_app_catalog_single_snapshot(
-        app_catalog_table=app_catalog_table,
-        date=run_date
+def feat_user_avg_app_popularity():
+    return spark.sql("""
+    WITH base AS (  -- фильтр «присутствия» приложений
+      SELECT date, hashed_aaid AS user_id, package_name AS app_id
+      FROM prod_atlas_datalake.ignite_silver.app_catalog_reporting_vw
+      WHERE app_catalog_schedule IN ('24hr','Heart_Beat')
+        AND is_system_package = false
+        AND partner = 'motorola'
+        AND package_name IS NOT NULL
+    ),
+    anchor AS (     -- ЯКОРЬ ПО КАЖДОМУ ЮЗЕРУ
+      SELECT user_id, MAX(date) AS d
+      FROM base
+      GROUP BY user_id
+    ),
+    now AS (        -- текущее окно вокруг личного якоря
+      SELECT DISTINCT b.user_id, b.app_id
+      FROM base b
+      JOIN anchor a
+        ON b.user_id = a.user_id
+       AND b.date BETWEEN date_sub(a.d, 2) AND a.d
+    ),
+    pop AS (        -- популярность из dataai_usage
+      SELECT CAST(product_id AS STRING) AS app_id,
+             COALESCE(est_install_base, est_average_active_users) AS popularity
+      FROM prod_atlas_datalake.ignite_silver.dataai_usage
+      WHERE device_code = 'all'
+        AND COALESCE(est_install_base, est_average_active_users) IS NOT NULL
     )
-    # app → genre mapping (same helper)
-    mapping_df = _load_and_normalize_mapping(mapping_source_table=mapping_source_table)
-
-    # user–app pairs (dedup)
-    user_apps = (
-        app_catalog_df
-        .select("hashed_aaid", "package_name")
-        .where(F.col("hashed_aaid").isNotNull() & F.col("package_name").isNotNull())
-        .dropDuplicates(["hashed_aaid", "package_name"])
-    )
-
-    # join with genres (left; unknown → "unknown")
-    joined = (
-        user_apps.join(mapping_df.select("app_id","genre"),
-                       on=user_apps["package_name"] == mapping_df["app_id"],
-                       how="left")
-                 .select(user_apps["hashed_aaid"].alias("user_id"),
-                         user_apps["package_name"].alias("app_id"),
-                         F.coalesce(F.col("genre"), F.lit("unknown")).alias("genre"))
-    )
-
-    # per-user counts by genre
-    genre_counts = (
-        joined.groupBy("user_id","genre")
-              .agg(F.countDistinct("app_id").alias("n_apps"))
-    )
-    # per-user total mapped apps
-    totals = (
-        genre_counts.groupBy("user_id")
-                    .agg(F.sum("n_apps").alias("user_total_mapped_apps"))
-    )
-    # proportions (user_id, genre, proportion)
-    props = (
-        genre_counts.join(totals, "user_id")
-                    .withColumn("proportion", F.col("n_apps")/F.col("user_total_mapped_apps"))
-                    .select("user_id","genre","proportion")
-    )
-
-    # global genre stats across users
-    stats = (
-        props.groupBy("genre")
-             .agg(F.avg("proportion").alias("mu"),
-                  F.stddev_pop("proportion").alias("sigma"))
-    )
-
-    # z-score per (user, genre)
-    ztab = (
-        props.join(stats, "genre")
-             .withColumn(
-                 "z",
-                 F.when((F.col("sigma").isNull()) | (F.col("sigma") == 0), F.lit(0.0))
-                  .otherwise( (F.col("proportion") - F.col("mu"))/F.col("sigma") )
-             )
-    )
-
-    # binary flag + feature_name
-    flags = (
-        ztab.select(
-            F.lit(run_date).cast("date").alias("date"),
-            F.col("user_id").alias("hashed_aaid"),
-            F.concat(
-                F.lit("user_inferred_affinity_"),
-                F.regexp_replace(F.lower(F.col("genre")), "[^a-z0-9]+", "_")
-            ).alias("feature_name"),
-            F.lit("bigint").alias("feature_type"),
-            F.when(F.col("z") > F.lit(z_threshold), F.lit(1)).otherwise(F.lit(0))
-             .cast("string").alias("feature_value")
-        )
-    )
-
-    return flags
+    SELECT n.user_id,
+           AVG(p.popularity) AS user_avg_app_popularity
+    FROM now n
+    JOIN pop p ON n.app_id = p.app_id
+    GROUP BY n.user_id
+    """)
