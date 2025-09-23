@@ -109,3 +109,24 @@ def avg_affinity_to_candidate_genre_from_agg(agg_df):
 
 def p75_affinity_to_candidate_genre_from_agg(agg_df):
     return agg_df.select("user_id","cand_pid","p75_affinity_to_candidate_genre")
+
+
+# 1) Load once as DataFrames
+app_catalog_df = spark.table("prod_atlas_datalake.ignite_silver.app_catalog_reporting_vw")
+cross_usage_df = spark.table("prod_one_dt_datalake.lakehouse_reporting.dataai_cross_app_usage")
+dim_apps_df    = spark.table("prod_one_dt_datalake.lakehouse_reporting.dataai_dim_company_apps")
+
+# 2) Compute aggregates once
+agg_df = affinity_agg_to_candidate_genre(app_catalog_df, cross_usage_df, dim_apps_df, window_days=30)
+
+# 3) Slice into the three features (no extra computation)
+df_max = max_affinity_to_candidate_genre_from_agg(agg_df)
+df_avg = avg_affinity_to_candidate_genre_from_agg(agg_df)
+df_p75 = p75_affinity_to_candidate_genre_from_agg(agg_df)
+
+# (optional) single wide df
+df_aff = (df_max
+          .join(df_avg, on=["user_id","cand_pid"], how="outer")
+          .join(df_p75, on=["user_id","cand_pid"], how="outer"))
+
+df_aff.show(20, truncate=False)
