@@ -1,24 +1,31 @@
+# ===== Affinity to candidate genre: single-pass computation with 3 features =====
 from pyspark.sql import functions as F
-from pyspark.sql import DataFrame
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 
 spark = SparkSession.builder.getOrCreate()
 
-# Enable Adaptive Query Execution & skew handling
+# Enable Adaptive Query Execution & skew handling (helps on large joins/shuffles)
 spark.conf.set("spark.sql.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
-# Let Spark pick partitions adaptively (or set a sane number, e.g. 600–1200 if cluster big)
+# Let Spark decide partitions adaptively (or set a concrete number if you prefer)
 spark.conf.set("spark.sql.shuffle.partitions", "auto")
 
+
+# ----------------------------- Helper: build pairs -----------------------------
 def build_user_candidate_pairs(
     app_catalog_df: DataFrame,
     cross_usage_df: DataFrame,
     dim_apps_df: DataFrame,
     window_days: int = 3,
     company_apps_table: str = "prod_one_dt_datalake.lakehouse_reporting.dataai_dim_company_apps",
-    device_agg: str = "avg"  # {"avg","max"}
+    device_agg: str = "avg"  # {"avg","max"}: how to aggregate cross-usage across device types
 ) -> DataFrame:
-    # Bridge mapping: package_name (slug) -> product_id
+    """
+    Returns 'pairs' with columns: user_id, cand_pid, aff
+    where 'aff' are cross-usage edges A->B restricted to candidate's genre.
+    """
+
+    # Bridge mapping: package_name (slug) -> product_id (normalize to avoid silent misses)
     company_apps_map = (
         _get_company_apps_dim(company_apps_table)
         .select(
@@ -26,10 +33,9 @@ def build_user_candidate_pairs(
             F.col("product_id").cast("long").alias("product_id_long"),
         )
     )
-    # Broadcast the small bridge
-    company_apps_map = F.broadcast(company_apps_map)  # <<<<
+    company_apps_map = F.broadcast(company_apps_map)  # small dim -> broadcast
 
-    # Normalize base portfolio and filter
+    # Normalize base portfolio and filter time window / partner / system packages
     base = (
         app_catalog_df
         .select(
@@ -48,6 +54,7 @@ def build_user_candidate_pairs(
         )
     )
 
+    # Map to product_id
     base = (
         base.alias("app")
         .join(company_apps_map.alias("dim"), F.col("app.app_pid") == F.col("dim.product_slug"), "left")
@@ -60,11 +67,11 @@ def build_user_candidate_pairs(
         )
     )
 
+    # Keep only 24hr / heart_beat snapshots
     base_f = base.where(F.col("sched").isin("24hr", "heart_beat")).select("date", "user_id", "app_pid", "product_id")
 
-    # Anchor per user and portfolio for that day
+    # Anchor per user (latest date) and user portfolio on that date
     anchor_u = base_f.groupBy("user_id").agg(F.max("date").alias("d"))
-
     user_apps = (
         base_f.alias("b")
         .join(anchor_u.alias("a"), (F.col("b.user_id") == F.col("a.user_id")) & (F.col("b.date") == F.col("a.d")), "inner")
@@ -72,15 +79,12 @@ def build_user_candidate_pairs(
         .dropDuplicates(["user_id", "product_id"])
     )
 
-    # ----- PERFORMANCE: reduce X early to only relevant from_pid -----
-    # Distinct set of from_pid present in current users' portfolios
-    active_from = user_apps.select(F.col("product_id").alias("from_pid")).distinct()
-    # Broadcast if small enough
-    active_from = F.broadcast(active_from)  # <<<< (safe if distinct products count is limited)
+    # PERFORMANCE: reduce cross-usage to only relevant 'from_pid' seen in current portfolios
+    active_from = F.broadcast(user_apps.select(F.col("product_id").alias("from_pid")).distinct())
 
-    # Build cross-usage matrix aggregated across all device types
+    # Cross-usage across ALL device types -> aggregate per (from_pid, to_pid)
     agg_expr = F.avg("aff") if device_agg == "avg" else F.max("aff")
-    x_full = (
+    x = (
         cross_usage_df
         .select(
             F.col("product_id").cast("long").alias("from_pid"),
@@ -88,28 +92,23 @@ def build_user_candidate_pairs(
             F.col("est_cross_product_affinity").alias("aff"),
         )
         .where(F.col("aff").isNotNull())
+        .join(active_from, on="from_pid", how="inner")                # shrink early
+        .groupBy("from_pid", "to_pid_long")
+        .agg(agg_expr.alias("aff"))
     )
 
-    # Keep only edges where from_pid is in active user portfolio
-    x = (
-        x_full.join(active_from, on="from_pid", how="inner")  # <<<< dramatically shrinks X
-            .groupBy("from_pid", "to_pid_long")
-            .agg(agg_expr.alias("aff"))
-    )
-
-    # Repartition heavy DF by join keys to reduce shuffle skew
-    user_apps = user_apps.repartition("product_id")      # <<<<
-    x = x.repartition("from_pid")                        # <<<<
+    # Repartition heavy DFs by join keys to reduce shuffle skew
+    user_apps = user_apps.repartition("product_id")
+    x = x.repartition("from_pid")
 
     # Genre for target apps (broadcast small dim)
-    to_pid_with_genre = (
+    to_pid_with_genre = F.broadcast(
         dim_apps_df
         .select(
             F.col("product_id").cast("long").alias("to_pid_long"),
             F.lower(F.trim(F.col("product_unified_category_name"))).alias("to_genre"),
         )
     )
-    to_pid_with_genre = F.broadcast(to_pid_with_genre)   # <<<<
 
     # Candidate apps per user
     cand_raw = (
@@ -133,7 +132,7 @@ def build_user_candidate_pairs(
         .select("cr.user_id", "cr.cand_pid_long", "d.cand_genre")
     )
 
-    # Collect edges A->B within candidate's genre
+    # Collect edges A->B that are inside candidate's genre
     pairs = (
         cand_with_genre.alias("cg")
         .join(user_apps.alias("ua"), F.col("ua.user_id") == F.col("cg.user_id"), "inner")
@@ -143,47 +142,53 @@ def build_user_candidate_pairs(
         .select(F.col("cg.user_id"), F.col("cg.cand_pid_long").alias("cand_pid"), F.col("x.aff"))
     )
 
-    # Optional: persist pairs if you compute several features afterwards
+    # Optionally persist if multiple downstream consumers will read it
     # pairs = pairs.persist()
-
     return pairs
 
 
+# ------------------------- Load sources (example views) -------------------------
+# Replace with your actual tables if names differ
+app_catalog_df = spark.table("prod_atlas_datalake.ignite_silver.app_catalog_reporting_vw")
+cross_usage_df = spark.table("prod_one_dt_datalake.lakehouse_reporting.dataai_cross_app_usage")
+dim_apps_df    = spark.table("prod_one_dt_datalake.lakehouse_reporting.dataai_dim_company_apps")
 
-# Feature 1: max affinity
-def f_affinity_max(pairs):
-    return pairs.groupBy("user_id", "cand_pid").agg(
-        F.max("aff").cast("double").alias("f_affinity_max_genre")
+
+# --------------------- Build pairs ONCE and compute features -------------------
+# Build once (you can tweak window_days or device_agg if needed)
+pairs = build_user_candidate_pairs(
+    app_catalog_df,
+    cross_usage_df,
+    dim_apps_df,
+    window_days=3,     # default 3-day window
+    device_agg="avg"   # or "max" to match another convention
+).persist()            # materialize to avoid re-computation
+
+# Single wide aggregation: one pass over data, 3 features at once
+agg = (
+    pairs.groupBy("user_id", "cand_pid")
+    .agg(
+        F.max("aff").cast("double").alias("f_affinity_max_genre"),
+        F.avg("aff").cast("double").alias("f_affinity_avg_genre"),
+        F.percentile_approx("aff", 0.75, 1000).cast("double").alias("f_affinity_p75_genre"),
     )
+).persist()
 
-# Feature 2: avg affinity
-def f_affinity_avg(pairs):
-    return pairs.groupBy("user_id", "cand_pid").agg(
-        F.avg("aff").cast("double").alias("f_affinity_avg_genre")
-    )
+# Slice into three feature DataFrames WITHOUT extra shuffles
+feat_max = agg.select("user_id", "cand_pid", "f_affinity_max_genre")
+feat_avg = agg.select("user_id", "cand_pid", "f_affinity_avg_genre")
+feat_p75 = agg.select("user_id", "cand_pid", "f_affinity_p75_genre")
 
-# Feature 3: 75th percentile affinity
-def f_affinity_p75(pairs):
-    return pairs.groupBy("user_id", "cand_pid").agg(
-        F.percentile_approx("aff", 0.75, 1000).cast("double").alias("f_affinity_p75_genre")
-    )
+# Lightweight peek (avoid heavy count(); limit is cheap)
+feat_max.limit(5).show(truncate=False)
+feat_avg.limit(5).show(truncate=False)
+feat_p75.limit(5).show(truncate=False)
 
+# When done, free memory
+pairs.unpersist()
+agg.unpersist()
 
-# --------- Example run in one cell ---------
-# Build base pairs once
-pairs = build_user_candidate_pairs(app_catalog_df, cross_usage_df, dim_apps_df)
-
-# Compute features separately
-feat_max = f_affinity_max(pairs)
-feat_avg = f_affinity_avg(pairs)
-feat_p75 = f_affinity_p75(pairs)
-
-# Show counts / sample
-print("pairs:", pairs.count())
-print("feat_max:", feat_max.count())
-print("feat_avg:", feat_avg.count())
-print("feat_p75:", feat_p75.count())
-
-feat_max.show(5, False)
-feat_avg.show(5, False)
-feat_p75.show(5, False)
+# Save as tables
+# feat_max.write.mode("overwrite").saveAsTable("schema.f_affinity_max_genre")
+# feat_avg.write.mode("overwrite").saveAsTable("schema.f_affinity_avg_genre")
+# feat_p75.write.mode("overwrite").saveAsTable("schema.f_affinity_p75_genre")
