@@ -63,14 +63,60 @@ SYS_PROMPT = """You are a senior incident analyst for CI/CD and cloud deployment
 You read raw logs and produce a crisp, actionable incident report.
 Be concise, technical, and specific. If uncertain, say so explicitly."""
 
-USER_TMPL = """Analyze the following deployment/runtime logs and return ONLY valid JSON following the schema.
+USER_TMPL = """Analyze the following deployment/runtime logs and return ONLY valid JSON following the schema."""
 
-Context (optional):
-- repo: {repo}
-- pr_id: {pr_id}
-- agent_id: {agent_id}
+#Context (optional):
+#- repo: {repo}
+#- pr_id: {pr_id}
+#- agent_id: {agent_id}
 
-Logs (digest):
+#Logs (digest):
+
+
+
+def _client() -> Anthropic:
+    if not ANTHROPIC_KEY:
+        raise RuntimeError("ANTHROPIC_AUTH_TOKEN is missing")
+    return Anthropic(api_key=ANTHROPIC_KEY)
+
+def analyze_logs_with_llm(digest: str, repo: str, pr_id: int, agent_id: str, retries: int = 3, backoff: float = 1.5) -> Report:
+    """Call Claude and validate JSON output. Retries on transient errors."""
+    payload = USER_TMPL.format(
+        repo=repo, pr_id=pr_id, agent_id=agent_id,
+        digest=digest,
+        schema=json.dumps(Report.model_json_schema(), ensure_ascii=False, indent=2),
+    )
+    client = _client()
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                temperature=TEMP,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                messages=[
+                    {"role": "system", "content": SYS_PROMPT},
+                    {"role": "user",   "content": payload},
+                ]
+            )
+            text = "".join([c.text for c in resp.content if getattr(c, "type", None) == "text"])  # robust extraction
+            data = json.loads(text)
+            report = Report.model_validate(data)
+            return report
+        except (RateLimitError, APIError) as e:
+            last_err = e
+            time.sleep(backoff ** attempt)
+        except (json.JSONDecodeError, ValidationError) as e:
+            # Ask model to fix to strict JSON on next attempt by appending a reminder
+            last_err = e
+            payload = payload + "\n\nREMINDER: Output must be STRICT JSON only. No markdown, no explanations."
+            time.sleep(backoff ** attempt)
+
+    raise RuntimeError(f"LLM analysis failed after {retries} attempts: {last_err}")
+
+
+
 
 
 
