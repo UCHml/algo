@@ -1,19 +1,29 @@
-# -----------------------------------------------------------------------------
-# Requirements:
-#   pip install boto3 anthropic pydantic
+# ---------------------------------------------------------------------------
+# worker.py (single file)
+# Purpose:
+#   - Long-poll AWS SQS and process messages safely (no loops)
+#   - CloudWatch JSON logger (singleton) with per-user/deployment context
+#   - Group messages in batches by (agent_id, repository) and analyze together
+#   - Build compact digest + call Anthropic Claude → strict JSON report
+#   - Log LLM report and save report artifact locally
 #
-# Environment variables:
+# Env:
 #   SQS_QUEUE_URL=...
 #   AWS_DEFAULT_REGION=us-east-1
-#   AWS_ACCESS_KEY_ID=...
-#   AWS_SECRET_ACCESS_KEY=...
-#   AWS_SESSION_TOKEN=...             # optional
-#   ANTHROPIC_AUTH_TOKEN=sk-...       # optional; if missing -> fallback
+#   AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=... [AWS_SESSION_TOKEN=?]
+#   # LLM:
+#   ANTHROPIC_AUTH_TOKEN=sk-...
 #   ANTHROPIC_MODEL=claude-3-haiku-20240307
 #   LLM_MAX_OUTPUT_TOKENS=600
 #   LLM_TEMPERATURE=0
+#   # Logging:
+#   LOG_LEVEL=info
+#   ENABLE_CW_LOGS=true|false
+#   CLOUDWATCH_GROUP=refinement-agents
+#   CLOUDWATCH_STREAM_PREFIX=dev
+#   # Safeguards:
 #   DEDUPLICATION_MINUTES=10
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -25,59 +35,120 @@ import signal
 import threading
 import time
 import hashlib
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
 from pydantic import BaseModel, Field, ValidationError
 
-# --- Optional Anthropic import (safe if key missing) ---
-try:
-    from anthropic import Anthropic, APIError, RateLimitError  # type: ignore
-except Exception:  # pragma: no cover
-    Anthropic = None  # type: ignore
-    APIError = Exception  # type: ignore
-    RateLimitError = Exception  # type: ignore
+# ======================= CloudWatch JSON logger (singleton) ===================
+
+_ctx_user: ContextVar[str] = ContextVar("ctx_user", default="-")
+_ctx_deploy: ContextVar[str] = ContextVar("ctx_deploy", default="-")
 
 
-# ----------------------------- Logging setup ---------------------------------
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-logger = logging.getLogger("sqs-worker")
+class JsonFormatter(logging.Formatter):
+    """Emit logs as JSON so they are easy to search in CloudWatch."""
+    def format(self, record: logging.LogRecord) -> str:
+        base = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "msg": record.getMessage(),
+            "user": _ctx_user.get(),
+            "deployment": _ctx_deploy.get(),
+            "logger": record.name,
+        }
+        if record.exc_info:
+            base["exc_info"] = self.formatException(record.exc_info)
+        if hasattr(record, "kv"):  # logger.info("...", extra={"kv": {...}})
+            base.update(record.kv)
+        return json.dumps(base, ensure_ascii=False)
 
 
-# ----------------------------- Global control --------------------------------
-# Global shutdown flag to stop loops gracefully
+class _CWLoggerSingleton:
+    _lock = threading.Lock()
+    _logger: logging.Logger | None = None
+
+    @classmethod
+    def get(cls) -> logging.Logger:
+        with cls._lock:
+            if cls._logger:
+                return cls._logger
+
+            logger = logging.getLogger("refinement")
+            logger.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper()))
+            logger.handlers.clear()
+
+            ch = logging.StreamHandler()
+            ch.setFormatter(JsonFormatter())
+            logger.addHandler(ch)
+
+            if os.getenv("ENABLE_CW_LOGS", "false").lower() == "true":
+                if not watchtower:
+                    raise RuntimeError("ENABLE_CW_LOGS=true, but 'watchtower' not installed")
+                group = os.getenv("CLOUDWATCH_GROUP", "refinement-agents")
+                stream_prefix = os.getenv("CLOUDWATCH_STREAM_PREFIX", "dev")
+                cwh = watchtower.CloudWatchLogHandler(
+                    log_group=group,
+                    stream_name=f"{stream_prefix}-%(asctime)s",
+                    create_log_group=True,
+                    send_interval=5,
+                    max_batch_count=50,
+                )
+                cwh.setFormatter(JsonFormatter())
+                logger.addHandler(cwh)
+
+            cls._logger = logger
+            return logger
+
+
+def get_logger() -> logging.Logger:
+    return _CWLoggerSingleton.get()
+
+
+def set_log_context(user: str | None = None, deployment: str | None = None):
+    """Set per-request context (user/deployment) to appear in every log line."""
+    if user is not None:
+        _ctx_user.set(user)
+    if deployment is not None:
+        _ctx_deploy.set(deployment)
+
+
+logger = get_logger()
+
+# ============================== Shutdown control ==============================
+
 SHUTDOWN = False
 
+
 def _handle_shutdown(*_):
-    """SIGINT/SIGTERM handler to exit gracefully."""
+    """SIGINT/SIGTERM handler to exit"""
     global SHUTDOWN
     SHUTDOWN = True
-    logger.info("🔻 Shutdown requested")
+    logger.info("Shutdown requested")
+
 
 signal.signal(signal.SIGINT, _handle_shutdown)
 signal.signal(signal.SIGTERM, _handle_shutdown)
 
+# ================================ Dedup store =================================
 
-# ----------------------------- Dedup store -----------------------------------
-# In-memory idempotency store to avoid re-processing same message within TTL.
-_SEEN: dict[str, datetime] = {}
+_SEEN: Dict[str, datetime] = {}
 _SEEN_TTL_MIN = int(os.getenv("DEDUPLICATION_MINUTES", "10"))
 _SEEN_LOCK = threading.Lock()
 
+
 def _dedup_key(message: dict) -> str:
-    """Create a stable deduplication key from MessageId+Body"""
+    """Stable deduplication key from MessageId+Body."""
     mid = message.get("MessageId", "")
     body = message.get("Body", "")
     return hashlib.sha256((mid + "|" + body).encode()).hexdigest()
 
+
 def seen_recently(key: str) -> bool:
-    """Return True if message was processed recently (within TTL)."""
     with _SEEN_LOCK:
         exp = _SEEN.get(key)
         if not exp:
@@ -87,22 +158,23 @@ def seen_recently(key: str) -> bool:
             return False
         return True
 
+
 def mark_seen(key: str) -> None:
-    """Mark message as processed for TTL minutes."""
     with _SEEN_LOCK:
         _SEEN[key] = datetime.utcnow() + timedelta(minutes=_SEEN_TTL_MIN)
 
+# ================================ LLM part ====================================
 
-# ----------------------------- LLM analyzer ----------------------------------
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_AUTH_TOKEN")
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
 MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "600"))
 TEMP = float(os.getenv("LLM_TEMPERATURE", "0"))
 
+
 class Report(BaseModel):
     """Strict schema for deterministic JSON report."""
-    severity: Literal["info","warn","error","critical"]
-    summary: str = Field(..., description="Short 2-3 sentence overview")
+    severity: Literal["info", "warn", "error", "critical"]
+    summary: str = Field(..., description="2–3 sentence overview")
     top_findings: List[str]
     probable_causes: List[str]
     next_steps: List[str]
@@ -110,17 +182,19 @@ class Report(BaseModel):
     evidence: List[str] = Field(default_factory=list)
     timeline: List[str] = Field(default_factory=list)
 
+
 _ERROR_PAT = re.compile(r"(?i)\b(error|exception|failed|traceback|crash|panic|fatal)\b")
-_WARN_PAT  = re.compile(r"(?i)\b(warn|warning|timeout|throttle)\b")
+_WARN_PAT = re.compile(r"(?i)\b(warn|warning|timeout|throttle)\b")
+
 
 def build_log_digest(raw: str, max_chars: int = 8000) -> str:
-    """Build a compact digest: error/warn lines + recent tail; dedup; cap length."""
+    """Compact digest: error/warn lines + recent tail; dedup; hard cap length."""
     if not raw:
         return ""
     lines = raw.splitlines()
     errors = [l for l in lines if _ERROR_PAT.search(l)]
-    warns  = [l for l in lines if _WARN_PAT.search(l)]
-    tail = "\n".join(lines[-500:])  # recent context
+    warns = [l for l in lines if _WARN_PAT.search(l)]
+    tail = "\n".join(lines[-500:])
     merged: list[str] = []
     seen: set[str] = set()
     for group in (errors[-100:], warns[-100:], [tail]):
@@ -135,28 +209,32 @@ def build_log_digest(raw: str, max_chars: int = 8000) -> str:
         digest = digest[-max_chars:]
     return digest
 
+
 def _anthropic_client() -> Anthropic:
-    """Create Anthropic client or raise if key is missing."""
     if not ANTHROPIC_KEY or Anthropic is None:
         raise RuntimeError("ANTHROPIC_AUTH_TOKEN missing or anthropic SDK not installed")
     return Anthropic(api_key=ANTHROPIC_KEY)
 
-_SYS_PROMPT = """You are a senior incident analyst for CI/CD and cloud deployments.
-You read raw logs and produce a crisp, actionable incident report.
-Be concise, technical, and specific. If uncertain, say so explicitly."""
+
+_SYS_PROMPT = (
+    "You are a senior incident analyst for CI/CD and cloud deployments. "
+    "Read logs and produce a crisp, actionable incident report."
+)
 
 _USER_TMPL = """Analyze the following deployment/runtime logs and return ONLY valid JSON following the schema.
 
-Context (optional):
+Context:
 - repo: {repo}
 - pr_id: {pr_id}
 - agent_id: {agent_id}
 
 Logs (digest):
-{digest} 
+{digest}
+
 JSON SCHEMA (output exactly this shape, no extra keys, no markdown):
 {schema}
 """
+
 
 def analyze_logs_with_llm(digest: str, repo: str, pr_id: int, agent_id: str,
                           retries: int = 3, backoff: float = 1.5) -> Report:
@@ -177,51 +255,44 @@ def analyze_logs_with_llm(digest: str, repo: str, pr_id: int, agent_id: str,
                 max_tokens=MAX_OUTPUT_TOKENS,
                 messages=[
                     {"role": "system", "content": _SYS_PROMPT},
-                    {"role": "user",   "content": payload},
-                ]
+                    {"role": "user", "content": payload},
+                ],
             )
-            # Robust text extraction (Anthropic returns a list of "content" blocks)
-            text_parts = []
+            parts = []
             for c in resp.content:
-                # Each block may have .type == "text" and .text attribute
                 if getattr(c, "type", None) == "text":
-                    text_parts.append(getattr(c, "text", ""))
-            text = "".join(text_parts).strip()
+                    parts.append(getattr(c, "text", ""))
+            text = "".join(parts).strip()
             data = json.loads(text)
-            report = Report.model_validate(data)
-            return report
+            return Report.model_validate(data)
         except (RateLimitError, APIError) as e:  # type: ignore
             last_err = e
             sleep_s = backoff ** attempt
-            logger.warning(f"LLM transient error (attempt {attempt}): {e}; retrying in {sleep_s:.1f}s")
+            logger.warning(f"LLM transient error (attempt {attempt}): {e}; retry in {sleep_s:.1f}s")
             time.sleep(sleep_s)
         except (json.JSONDecodeError, ValidationError) as e:
-            # Ask model to fix to strict JSON on next attempt
             last_err = e
-            payload = payload + "\n\nREMINDER: Output must be STRICT JSON only. No markdown, no explanations."
+            payload += "\n\nREMINDER: Output must be STRICT JSON only. No markdown."
             sleep_s = backoff ** attempt
-            logger.warning(f"LLM JSON/validation error (attempt {attempt}): {e}; retrying in {sleep_s:.1f}s")
+            logger.warning(f"LLM JSON/validation error (attempt {attempt}): {e}; retry in {sleep_s:.1f}s")
             time.sleep(sleep_s)
 
     raise RuntimeError(f"LLM analysis failed after {retries} attempts: {last_err}")
 
+# =============================== SQS Worker ===================================
 
-# ----------------------------- SQS Worker ------------------------------------
 class SQSWorker:
-    """SQS long-poll worker with visibility heartbeat, dedup and LLM analysis."""
+    """SQS worker: long-poll + visibility heartbeat + dedup + batch LLM analysis."""
 
     def __init__(self) -> None:
         self.queue_url = os.environ["SQS_QUEUE_URL"]
         region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-        # Explicit region to avoid incorrect defaults
         self.sqs = boto3.client("sqs", region_name=region)
 
-        # (Optional) your repository adapter for PR comments, replace with real one
-        self.repository = DummyRepositoryAdapter()
+    # ----------- polling ------------
 
-    # -------------------------------------------------------------------------
-    def poll_messages(self) -> list[dict]:
-        """Long-poll SQS for up to 5 messages (saves CPU and API calls)."""
+    def poll_messages(self) -> List[dict]:
+        """Long-poll SQS for up to 5 messages."""
         try:
             resp = self.sqs.receive_message(
                 QueueUrl=self.queue_url,
@@ -235,62 +306,75 @@ class SQSWorker:
             time.sleep(5)
             return []
 
-    # -------------------------------------------------------------------------
-    def process_message(self, message: dict) -> None:
-        """Process a single message: dedup -> heartbeat -> analyze -> save report."""
-        # 1) Deduplicate
-        dedup = _dedup_key(message)
-        if seen_recently(dedup):
-            logger.info("↩️ Duplicate within TTL – skipping without analysis")
-            return
+    # ----------- grouping for batch analysis ------------
 
-        # 2) Start visibility heartbeat
-        receipt = message["ReceiptHandle"]
+    def group_by_actor(self, messages: List[dict]) -> Dict[Tuple[str, str], List[dict]]:
+        """Group messages by (agent_id, repository_name)."""
+        groups: Dict[Tuple[str, str], List[dict]] = {}
+        for m in messages:
+            try:
+                body = json.loads(m["Body"])
+                agent = str(body.get("agent_id", "-"))
+                repo = str(body.get("repository_name", "-"))
+                groups.setdefault((agent, repo), []).append(m)
+            except Exception:
+                groups.setdefault(("-", "-"), []).append(m)
+        return groups
+
+    # ----------- visibility heartbeat ------------
+
+    def _start_heartbeat(self, receipt_handle: str) -> tuple[list[bool], threading.Thread]:
+        """Start a background thread that keeps the message invisible."""
         _done = [False]
 
-        def _extend_visibility():
-            """Keep SQS message invisible while we are processing."""
+        def _extend():
             while not _done[0] and not SHUTDOWN:
                 time.sleep(10)
                 try:
                     self.sqs.change_message_visibility(
                         QueueUrl=self.queue_url,
-                        ReceiptHandle=receipt,
+                        ReceiptHandle=receipt_handle,
                         VisibilityTimeout=60,
                     )
                 except Exception as ex:
                     logger.warning(f"Visibility extend failed: {ex}")
 
-        heartbeat = threading.Thread(target=_extend_visibility, daemon=True)
-        heartbeat.start()
+        t = threading.Thread(target=_extend, daemon=True)
+        t.start()
+        return _done, t
+
+    # ----------- single message processing (used as fallback) ------------
+
+    def process_message(self, message: dict) -> Optional[Report]:
+        """Process a single message (non-batch path)."""
+        dedup = _dedup_key(message)
+        if seen_recently(dedup):
+            logger.info("↩️ Duplicate within TTL – skipping without analysis")
+            return None
+
+        receipt = message["ReceiptHandle"]
+        done, _t = self._start_heartbeat(receipt)
 
         try:
-            # 3) Parse body (expect JSON or plain text)
             try:
-                body_raw = message.get("Body", "")
-                body = json.loads(body_raw)
+                body = json.loads(message.get("Body", ""))
             except json.JSONDecodeError:
                 body = message.get("Body", "")
 
-            # Expect these fields in JSON messages (adapt to your schema if needed)
-            # If absent, fall back to 'unknown' values so demo still works.
-            repository_name = (body.get("repository_name") if isinstance(body, dict) else "unknown-repo") or "unknown-repo"
+            repo = (body.get("repository_name") if isinstance(body, dict) else "unknown-repo") or "unknown-repo"
             pr_id = int(body.get("pr_id") if isinstance(body, dict) and body.get("pr_id") is not None else -1)
-            agent_id = str(body.get("agent_id") if isinstance(body, dict) else "unknown-agent")
+            agent = str(body.get("agent_id") if isinstance(body, dict) else "unknown-agent")
 
-            # 4) Build compact digest to save LLM tokens
+            set_log_context(user=agent, deployment=f"{repo}#PR{pr_id}")
+
             raw_log = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
             digest = build_log_digest(raw_log, max_chars=8000)
 
-            # 5) LLM analysis → strict JSON report (fallback if LLM disabled)
             try:
-                report: Report = analyze_logs_with_llm(
-                    digest=digest,
-                    repo=repository_name,
-                    pr_id=pr_id,
-                    agent_id=agent_id,
-                )
-                logger.info("🧠 LLM report assembled")
+                report = analyze_logs_with_llm(digest=digest, repo=repo, pr_id=pr_id, agent_id=agent)
+                logger.info("🧠 LLM report assembled",
+                            extra={"kv": {"severity": report.severity, "repo": repo, "pr": pr_id,
+                                          "next_steps": report.next_steps[:3]}})
             except Exception as e:
                 logger.warning(f"LLM analysis failed, using fallback: {e}")
                 sev = "error" if "error" in (raw_log or "").lower() else "warn"
@@ -301,91 +385,136 @@ class SQSWorker:
                     probable_causes=["LLM API error or insufficient context"],
                     next_steps=["Retry analysis later", "Check CI/CD logs for root error"],
                     impacted_components=[],
-                    evidence=digest.splitlines()[-5:],
+                    evidence=(digest.splitlines()[-5:] if digest else []),
                     timeline=[],
                 )
 
-            # 6) Persist JSON report locally
             ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            artifacts = Path("./artifacts")
-            artifacts.mkdir(parents=True, exist_ok=True)
-            out_path = artifacts / f"{ts}_pr{pr_id}_report.json"
-            out_path.write_text(report.model_dump_json(indent=2, ensure_ascii=False))
-            logger.info(f"📄 Report saved: {out_path}")
+            artifacts = Path("./artifacts"); artifacts.mkdir(parents=True, exist_ok=True)
+            out = artifacts / f"{ts}_pr{pr_id}_report.json"
+            out.write_text(report.model_dump_json(indent=2, ensure_ascii=False))
+            logger.info(f"📄 Report saved", extra={"kv": {"path": str(out)}})
 
-            # 7) Optional: post a short summary to PR (replace with your adapter)
-            if pr_id != -1:
-                short = (
-                    f"**Deployment Incident Report (auto)**\n"
-                    f"- Severity: `{report.severity}`\n"
-                    f"- Summary: {report.summary}\n"
-                    f"- Next steps: " + "; ".join(report.next_steps[:3])
-                )
-                try:
-                    self.repository.comment_on_pr(pr_id, short)
-                except Exception as ex:
-                    logger.warning(f"PR comment failed: {ex}")
-
-            # 8) Mark dedup to avoid re-analyzing on re-delivery
+            # mark dedup so repeated deliveries won't burn tokens
             mark_seen(dedup)
+            return report
 
-            # If your team decides to remove SQS messages upon success,
-            # uncomment the next line (canonical SQS behavior):
-            # self.delete_message(message)
-
-        except Exception as e:
-            logger.exception(f"💥 Unexpected error while processing message: {e}")
         finally:
-            # Stop visibility heartbeat in any case
-            _done[0] = True
+            # stop heartbeat in any case
+            done[0] = True
 
-    # -------------------------------------------------------------------------
+    # ----------- batch processing ------------
+
+    def process_batch(self, agent: str, repo: str, batch: List[dict]) -> Optional[Report]:
+        """
+        Analyze multiple messages at once (one LLM call) for the same (agent, repo).
+        We still start heartbeats for each message to avoid re-pick by other workers.
+        """
+        # Build joined logs, start all heartbeats, handle dedup
+        joined_logs: List[str] = []
+        heartbeats: List[list[bool]] = []
+        dedup_keys: List[str] = []
+        receipts: List[str] = []
+
+        for m in batch:
+            dk = _dedup_key(m)
+            if seen_recently(dk):
+                continue
+            dedup_keys.append(dk)
+            receipts.append(m["ReceiptHandle"])
+            done, _t = self._start_heartbeat(m["ReceiptHandle"])
+            heartbeats.append(done)
+
+            try:
+                body = json.loads(m.get("Body", ""))
+            except json.JSONDecodeError:
+                body = m.get("Body", "")
+            raw = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+            joined_logs.append(raw)
+
+        if not joined_logs:
+            return None
+
+        set_log_context(user=agent, deployment=f"{repo}#batch")
+        digest = build_log_digest("\n---\n".join(joined_logs), max_chars=8000)
+
+        # Using pseudo PR id -1 for batch reports (no single PR context)
+        try:
+            report = analyze_logs_with_llm(digest=digest, repo=repo, pr_id=-1, agent_id=agent)
+            logger.info("Batch LLM report assembled",
+                        extra={"kv": {"repo": repo, "user": agent, "batch_size": len(joined_logs),
+                                      "severity": report.severity}})
+        except Exception as e:
+            logger.warning(f"LLM batch analysis failed, using fallback: {e}")
+            sev = "error" if "error" in digest.lower() else "warn"
+            report = Report(
+                severity=sev,
+                summary="Heuristic batch summary due to LLM failure.",
+                top_findings=["See digest tail"],
+                probable_causes=["LLM API error or insufficient context"],
+                next_steps=["Retry analysis later", "Check CI/CD logs"],
+                impacted_components=[],
+                evidence=digest.splitlines()[-5:],
+                timeline=[],
+            )
+
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        artifacts = Path("./artifacts"); artifacts.mkdir(parents=True, exist_ok=True)
+        out = artifacts / f"{ts}_batch_{agent}_{repo.replace('/','_')}.json"
+        out.write_text(report.model_dump_json(indent=2, ensure_ascii=False))
+        logger.info("📄 Batch report saved", extra={"kv": {"path": str(out)}})
+
+        # mark all messages as seen (so repeated deliveries won't trigger analysis again)
+        for dk in dedup_keys:
+            mark_seen(dk)
+        # stop all heartbeats
+        for d in heartbeats:
+            d[0] = True
+
+        return report
+
+    # ----------- deletion -------------
+
     def delete_message(self, message: dict) -> None:
-        """Delete the message from SQS (optional; canonical success behavior)."""
         try:
             self.sqs.delete_message(
                 QueueUrl=self.queue_url,
                 ReceiptHandle=message["ReceiptHandle"],
             )
-            logger.info("✅ Message deleted from SQS")
+            logger.info("Message deleted from SQS")
         except ClientError as e:
             logger.error(f"Failed to delete message: {e}")
 
-    # -------------------------------------------------------------------------
+    # ----------- main loop ------------
+
     def run(self) -> None:
-        """Main loop: long-poll SQS, process batch, exit gracefully on signal."""
-        logger.info("🚀 SQS worker started")
+        logger.info("SQS worker started")
         while not SHUTDOWN:
             try:
                 msgs = self.poll_messages()
                 if not msgs:
-                    # small idle sleep to avoid tight-loop when empty
                     time.sleep(1)
                     continue
-                for m in msgs:
-                    if SHUTDOWN:
-                        break
-                    self.process_message(m)
+
+                # group and do batch analysis
+                groups = self.group_by_actor(msgs)
+                for (agent, repo), batch in groups.items():
+                    # 1) batch analysis (one LLM call for the group)
+                    self.process_batch(agent, repo, batch)
+                    # if we don't need batch
+                    # for m in batch: self.process_message(m)
+
             except KeyboardInterrupt:
                 logger.info("Interrupted by user")
                 break
             except Exception as e:
                 logger.error(f"Unexpected loop error: {e}")
                 time.sleep(5)
-        logger.info("👋 Worker stopped")
-
-
-# --------------------------- Dummy repo adapter -------------------------------
-class DummyRepositoryAdapter:
-    """
-    Placeholder adapter for posting comments to PRs.
-    Replace with your project's real GitHub/Azure adapter.
-    """
-    def comment_on_pr(self, pr_number: int, text: str) -> None:
-        logger.info(f"(PR #{pr_number}) Comment preview:\n{text}")
+        logger.info("Worker stopped")
 
 
 # ---------------------------------- Main -------------------------------------
+
 def main() -> None:
     # Validate required env vars early
     missing = [k for k in ["SQS_QUEUE_URL", "AWS_DEFAULT_REGION"] if not os.getenv(k)]
@@ -394,6 +523,7 @@ def main() -> None:
 
     worker = SQSWorker()
     worker.run()
+
 
 if __name__ == "__main__":
     main()
